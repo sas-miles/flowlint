@@ -62,6 +62,12 @@ export interface RuleLite {
   run(ctx: unknown): RuleResultLite[];
 }
 
+export type ComboDetectionPolicy = 
+  | 'api-first'      // Use API when available, fallback to heuristic (default)
+  | 'api-only'       // Use API only, return false if unavailable  
+  | 'heuristic-only' // Always use regex heuristic, ignore API
+  | ((apiResult: boolean | null | undefined, heuristicResult: boolean, className: string) => boolean); // Custom function
+
 export interface Preset {
   id: string;
   grammar?: GrammarAdapter;
@@ -77,6 +83,8 @@ export interface Preset {
       options?: Record<string, unknown>;
     }
   >;
+  /** Optional combo class detection strategy override */
+  comboDetectionPolicy?: ComboDetectionPolicy;
 }
 
 export interface ProjectConfig {

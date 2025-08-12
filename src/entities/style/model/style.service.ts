@@ -1,4 +1,11 @@
-// Rehomed from features/linter/services/style-service.ts (no logic changes)
+import { getCurrentPreset } from "@/features/linter/model/linter.factory";
+import { getPresetById } from "@/presets";
+import type { Preset } from "@/features/linter/model/linter.types";
+
+// Declare webflow global
+declare const webflow: {
+  getAllStyles: () => Promise<Style[]>;
+};
 
 interface Style {
   id: string;
@@ -9,6 +16,8 @@ interface Style {
   isComboClass?: () => Promise<boolean>;
 }
 
+export type ComboDetectionSource = 'api' | 'heuristic' | 'policy';
+
 export interface StyleInfo {
   id: string;
   name: string;
@@ -16,6 +25,8 @@ export interface StyleInfo {
   order: number;
   // True when Webflow marks this style as a combo class; fallback to name prefix when API unavailable
   isCombo: boolean;
+  // Diagnostic field: tracks how combo classification was determined
+  comboDetectionSource?: ComboDetectionSource;
 }
 
 export interface ElementStyleInfo {
@@ -25,6 +36,64 @@ export interface ElementStyleInfo {
 
 export interface StyleWithElement extends StyleInfo {
   elementId: string;
+}
+
+/**
+ * Detects if a class is a combo class using API-first approach with preset policy support
+ */
+async function detectComboClass(
+  style: Style,
+  className: string,
+  preset?: Preset
+): Promise<{ isCombo: boolean; source: ComboDetectionSource }> {
+  const DEBUG = false;
+  
+  // Existing heuristic logic as fallback
+  const heuristicResult = /^(?:is-[A-Za-z0-9]|is_[A-Za-z0-9]|is[A-Z]).*/.test(className);
+  
+  let apiResult: boolean | null | undefined;
+  let hasApiMethod = false;
+  
+  // Try to get API result if method is available
+  if (typeof style.isComboClass === 'function') {
+    hasApiMethod = true;
+    try {
+      apiResult = await style.isComboClass();
+      if (DEBUG) console.log(`API result for "${className}": ${apiResult}`);
+    } catch (error) {
+      if (DEBUG) console.warn(`API error for "${className}":`, error);
+      apiResult = null;
+    }
+  }
+  
+  // Apply preset policy if defined
+  const policy = preset?.comboDetectionPolicy ?? 'api-first';
+  
+  if (typeof policy === 'function') {
+    const result = policy(apiResult, heuristicResult, className);
+    return { isCombo: result, source: 'policy' };
+  }
+  
+  switch (policy) {
+    case 'api-only':
+      // Only use API, return false if unavailable
+      return { 
+        isCombo: apiResult === true, 
+        source: hasApiMethod ? 'api' : 'policy' 
+      };
+    
+    case 'heuristic-only':
+      // Always use heuristic, ignore API
+      return { isCombo: heuristicResult, source: 'heuristic' };
+    
+    case 'api-first':
+    default:
+      // Use API when available and not null/undefined, otherwise fallback to heuristic
+      if (apiResult !== null && apiResult !== undefined) {
+        return { isCombo: apiResult, source: 'api' };
+      }
+      return { isCombo: heuristicResult, source: 'heuristic' };
+  }
 }
 
 // Module-level cache for site-wide styles (memoized for the session)
@@ -40,15 +109,26 @@ export const createStyleService = () => {
         if (DEBUG) console.log(`Retrieved ${allStyles.length} styles from webflow.getAllStyles()`);
 
         if (DEBUG) console.log('Extracting names and properties from all styles...');
+        
+        // Get current preset for combo detection policy
+        let currentPreset: Preset | undefined;
+        try {
+          const presetId = getCurrentPreset();
+          currentPreset = getPresetById(presetId);
+        } catch (error) {
+          if (DEBUG) console.warn('Could not get current preset:', error);
+        }
+        
         const allStylesWithProperties = await Promise.all(
           allStyles.map(async (style, index) => {
             try {
               const name = await style.getName();
               let properties = {};
-              // Combo detection is grammar/preset-specific.
-              // Align with Lumos grammar: treat variant-like classes as combos even if misformatted
-              // Matches: is-foo, is_bar, isActive
-              const isCombo = /^(?:is-[A-Za-z0-9]|is_[A-Za-z0-9]|is[A-Z]).*/.test(name || "");
+              
+              // Use new API-first combo detection
+              const comboDetection = await detectComboClass(style, name || "", currentPreset);
+              const isCombo = comboDetection.isCombo;
+              const comboDetectionSource = comboDetection.source;
 
               if (name && name.startsWith('u-')) {
                 try {
@@ -63,11 +143,19 @@ export const createStyleService = () => {
                 name: name?.trim() || "",
                 properties,
                 index,
-                isCombo
+                isCombo,
+                comboDetectionSource
               };
             } catch (err) {
               if (DEBUG) console.error(`Error getting name for style at index ${index}, ID ${style.id}:`, err);
-              return { id: style.id, name: "", properties: {}, index, isCombo: false };
+              return { 
+                id: style.id, 
+                name: "", 
+                properties: {}, 
+                index, 
+                isCombo: false,
+                comboDetectionSource: 'heuristic' as ComboDetectionSource
+              };
             }
           })
         );
@@ -106,6 +194,15 @@ export const createStyleService = () => {
       return [];
     }
 
+    // Get current preset for combo detection policy
+    let currentPreset: Preset | undefined;
+    try {
+      const presetId = getCurrentPreset();
+      currentPreset = getPresetById(presetId);
+    } catch (error) {
+      if (DEBUG) console.warn('Could not get current preset:', error);
+    }
+
     const seenIds = new Set<string>();
     const uniqueStyles: StyleInfo[] = [];
 
@@ -116,8 +213,11 @@ export const createStyleService = () => {
         const id = style.id;
         const name = await style.getName();
         const trimmedName = name?.trim() || "";
-        // Combo detection aligned with Lumos grammar: allow misformatted variants to be flagged
-        const isCombo = /^(?:is-[A-Za-z0-9]|is_[A-Za-z0-9]|is[A-Z]).*/.test(trimmedName);
+        
+        // Use new API-first combo detection
+        const comboDetection = await detectComboClass(style, trimmedName, currentPreset);
+        const isCombo = comboDetection.isCombo;
+        const comboDetectionSource = comboDetection.source;
         
         if (id && !seenIds.has(id)) {
           seenIds.add(id);
@@ -131,8 +231,15 @@ export const createStyleService = () => {
             }
           }
 
-          uniqueStyles.push({ id, name: trimmedName, properties, order: i, isCombo });
-          if (DEBUG) console.log(`Added unique style: ${trimmedName} (ID: ${id})`);
+          uniqueStyles.push({ 
+            id, 
+            name: trimmedName, 
+            properties, 
+            order: i, 
+            isCombo, 
+            comboDetectionSource 
+          });
+          if (DEBUG) console.log(`Added unique style: ${trimmedName} (ID: ${id}, combo: ${isCombo}, source: ${comboDetectionSource})`);
         }
       } catch (err) {
         console.error(`Error processing applied style at index ${i}:`, err);
